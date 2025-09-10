@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Charging Live Wallpaper (5s loop)</title>
+<style>
+  /* Make the canvas fill the screen while preserving a 16:9 safe area */
+  html,body {
+    height:100%;
+    margin:0;
+    background:#000;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    -webkit-touch-callout:none;
+    -webkit-user-select:none;
+    -ms-user-select:none;
+    user-select:none;
+    overflow:hidden;
+  }
+
+  /* Container keeps 16:9 aspect ratio and scales to fit */
+  .frame {
+    width:100vmin;         /* scale down on small screens */
+    height:calc(100vmin * 9 / 16);
+    max-width:100%;
+    max-height:100%;
+    position:relative;
+    overflow:hidden;
+    border-radius:0px;
+    background:linear-gradient(180deg,#000 0%, #020208 60%);
+    box-shadow: 0 0 60px rgba(0,0,0,0.6) inset;
+  }
+
+  /* On very wide screens, keep it 16:9 by using width */
+  @media (min-aspect-ratio:16/9) {
+    .frame {
+      height:100vh;
+      width:calc(100vh * 16 / 9);
+    }
+  }
+
+  canvas {
+    width:100%;
+    height:100%;
+    display:block;
+    image-rendering: auto;
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+  }
+
+  /* subtle instruction overlay (hidden after load) */
+  .hint {
+    position:absolute;
+    left:12px;
+    bottom:12px;
+    color:rgba(255,255,255,0.65);
+    font-family: Inter, Roboto, system-ui, sans-serif;
+    font-size:12px;
+    backdrop-filter: blur(6px);
+    padding:6px 10px;
+    border-radius:8px;
+  }
+</style>
+</head>
+<body>
+  <div class="frame" id="frame">
+    <canvas id="gl"></canvas>
+    <div class="hint" id="hint">5s loop • Plug-in charging visual</div>
+  </div>
+
+<script id="fragshader" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2 u_res;
+uniform float u_time; // loops 0..1 over 5s
+uniform float u_aspect;
+
+// Hash / noise helpers
+float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123);}
+float noise(vec2 p){
+  vec2 i=floor(p); vec2 f=fract(p);
+  float a=hash(i), b=hash(i+vec2(1,0)), c=hash(i+vec2(0,1)), d=hash(i+vec2(1,1));
+  vec2 u=f*f*(3.0-2.0*f);
+  return mix(a,b,u.x)+ (c-a)*u.y*(1.0-u.x)+(d-b)*u.x*u.y;
+}
+
+// palette
+vec3 palette(float t){
+  vec3 a = vec3(0.05, 0.1, 0.12);
+  vec3 b = vec3(0.0, 0.9, 0.9);
+  vec3 c = vec3(0.9, 0.6, 0.1);
+  t = smoothstep(0.0,1.0,t);
+  return mix(a, mix(b,c, smoothstep(0.4,1.0,t) ), t);
+}
+
+// soft glow
+float smin(float a, float b, float k) {
+  float h = clamp(0.5+0.5*(b-a)/k, 0.0, 1.0);
+  return mix(b,a,h) - k*h*(1.0-h);
+}
+
+// sphere SDF
+float sdSphere(vec3 p, float r){ return length(p)-r; }
+
+// rotate
+mat3 rotX(float a){ float s=sin(a), c=cos(a); return mat3(1,0,0, 0,c,-s, 0,s,c); }
+mat3 rotY(float a){ float s=sin(a), c=cos(a); return mat3(c,0,s, 0,1,0, -s,0,c); }
+mat3 rotZ(float a){ float s=sin(a), c=cos(a); return mat3(c,-s,0, s,c,0, 0,0,1); }
+
+// Raymarching
+float map(vec3 p, out float mat){
+  // central core (pulsing)
+  float pulse = 0.08 + 0.12 * sin(u_time*6.28318*2.0); // faster inner pulse
+  float core = sdSphere(p, 0.5 + pulse*0.35);
+  mat = 1.0;
+
+  // inner fractal-ish shell (energy)
+  float shell = sdSphere(p, 0.7 + 0.06 * sin(u_time*6.28318)) - 0.02*noise(p.xy*8.0 + u_time*6.0);
+  core = smin(core, shell, 0.25);
+
+  // rotating ring discs
+  vec3 rp = p;
+  rp.y += 0.0;
+  rp = rp * rotY(u_time*6.28318*0.2);
+  float ring = length(vec2(length(rp.xz)-1.15, rp.y)) - 0.06 - 0.02*sin(u_time*6.28318*1.5 + rp.x*6.0);
+  core = smin(core, ring, 0.06);
+
+  return core;
+}
+
+// lighting and shading
+vec3 shade(vec3 ro, vec3 rd, float t, float mat) {
+  vec3 p = ro + rd * t;
+  // normal from gradient
+  float eps = 0.001;
+  float m; 
+  float d = map(p, m);
+  vec3 n = normalize(vec3(
+    map(p+vec3(eps,0,0), m)-d,
+    map(p+vec3(0,eps,0), m)-d,
+    map(p+vec3(0,0,eps), m)-d
+  ));
+  vec3 lightDir = normalize(vec3(0.3,0.8,0.6));
+  float diff = clamp(dot(n, lightDir), 0.0, 1.0);
+  // rim
+  float rim = pow(1.0 - max(0.0, dot(n, -rd)), 3.0);
+  // core emissive map using noise
+  float nval = noise(p.xy*6.0 + u_time*3.0);
+  float glow = smoothstep(0.6,0.95, 0.5 + nval*0.5 + rim*0.6);
+  vec3 col = palette( clamp(0.35 + 0.6*glow + diff*0.6, 0.0, 1.0) );
+  // add strong inner highlight
+  col += vec3(1.2,0.9,0.6) * pow(glow, 2.2) * 0.7;
+  // faint volumetric streaks
+  col += 0.12 * vec3(0.6,0.8,1.0) * sin(u_time*6.28318*3.0 + p.x*20.0)*0.5;
+  return col;
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy / u_res.xy) * 2.0 - 1.0;
+  uv.x *= u_aspect;
+  // camera
+  vec3 ro = vec3(0.0, 0.0, 3.2);
+  // slow camera bob + spin to feel "3D"
+  float camSpin = (u_time - 0.5) * 2.0 * 3.1415926 * 0.12;
+  ro = ro * rotY(camSpin);
+  vec3 rd = normalize(vec3(uv.xy, -1.6));
+  rd = rd * rotY(camSpin*0.9) * rotX(sin(u_time*6.28318)*0.05);
+
+  // raymarch
+  float t = 0.0;
+  float dist;
+  float mat = 0.0;
+  float glowAcc = 0.0;
+  vec3 col = vec3(0.0);
+
+  for(int i=0;i<120;i++){
+    vec3 p = ro + rd * t;
+    dist = map(p, mat);
+    if(dist<0.001) { break; }
+    // accumulate soft volumetric glow for near-hit distances
+    float g = exp(-dist*14.0) * 0.06;
+    glowAcc += g;
+    t += dist * 0.7;
+    if(t>8.0) break;
+  }
+
+  if(t < 8.0){
+    // shading at surface
+    col += shade(ro,rd,t,mat);
+  }
+
+  // add accumulated glow
+  col += vec3(0.2,0.4,0.6) * glowAcc * 1.6;
+
+  // animated particle field (foreground / sparks)
+  float particle = 0.0;
+  for(int i=0;i<5;i++){
+    float fi = float(i);
+    vec2 ppos = uv * (1.0 + 0.2*fi);
+    float sp = fract(sin(dot(ppos.xy, vec2(12.9898,78.233) + fi))*43758.5453);
+    float life = fract(sp + u_time*1.5 + fi*0.3);
+    float s = smoothstep(0.0,0.08, 0.08 - length(ppos - vec2(sin(u_time*6.2831* (0.3+fi*0.1))*0.25, cos(u_time*6.2831*(0.5+fi*0.07))*0.15)) );
+    particle += s * (0.6 + 0.4*fi);
+  }
+  col += vec3(0.8,0.95,1.0)*particle*0.12;
+
+  // vignette and chromatic-ish final
+  float v = smoothstep(1.2,0.2, length(uv));
+  col *= mix(vec3(0.85), vec3(1.0), v);
+
+  // simulate a charging pulse sweep across time
+  float pulsePhase = sin(u_time * 6.28318);
+  col *= 0.8 + 0.45 * smoothstep(-0.2, 0.9, pulsePhase);
+
+  // tonemap and gamma
+  col = 1.0 - exp(-col*1.0);
+  col = pow(col, vec3(0.9));
+  gl_FragColor = vec4(col,1.0);
+}
+</script>
+
+<script>
+(() => {
+  // Setup canvas & WebGL
+  const canvas = document.getElementById('gl');
+  const frame = document.getElementById('frame');
+  const hint = document.getElementById('hint');
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+
+  function resize() {
+    // fit canvas to container
+    const rect = frame.getBoundingClientRect();
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    canvas.style.width = rect.width + 'px';
+    canvas.style.height = rect.height + 'px';
+    gl.viewport(0,0,canvas.width,canvas.height);
+    aspect = (canvas.width / canvas.height);
+  }
+
+  // init WebGL
+  const gl = canvas.getContext('webgl', { alpha:false, antialias:true });
+  if(!gl){ canvas.parentNode.innerHTML = "<div style='color:#fff;padding:20px;font-family:sans-serif'>WebGL not supported</div>"; return; }
+
+  // compile shaders
+  function compile(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+      console.error(gl.getShaderInfoLog(s)); throw new Error('Shader compile error');
+    }
+    return s;
+  }
+
+  const fragSrc = document.getElementById('fragshader').textContent;
+  const vertSrc = `
+    attribute vec2 position;
+    void main(){ gl_Position = vec4(position,0.0,1.0); }
+  `;
+
+  const vs = compile(gl.VERTEX_SHADER, vertSrc);
+  const fs = compile(gl.FRAGMENT_SHADER, fragSrc);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if(!gl.getProgramParameter(program, gl.LINK_STATUS)){ console.error(gl.getProgramInfoLog(program)); throw new Error('Program link error'); }
+  gl.useProgram(program);
+
+  // fullscreen triangle
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1,-1,  3,-1,  -1,3
+  ]), gl.STATIC_DRAW);
+  const pos = gl.getAttribLocation(program, 'position');
+  gl.enableVertexAttribArray(pos);
+  gl.vertexAttribPointer(pos,2,gl.FLOAT,false,0,0);
+
+  // uniforms
+  const u_res = gl.getUniformLocation(program, 'u_res');
+  const u_time = gl.getUniformLocation(program, 'u_time');
+  const u_aspect = gl.getUniformLocation(program, 'u_aspect');
+
+  // initial resize
+  let aspect = 16.0/9.0;
+  resize();
+  window.addEventListener('resize', resize);
+
+  // animation timing: loop every 5 seconds
+  const LOOP = 5.0;
+  let start = performance.now();
+  function render(now){
+    const elapsed = (now - start) / 1000.0;
+    const t = (elapsed % LOOP) / LOOP; // 0..1
+    gl.uniform2f(u_res, canvas.width, canvas.height);
+    gl.uniform1f(u_time, t);
+    gl.uniform1f(u_aspect, (canvas.width / canvas.height) * (canvas.height / Math.max(1, canvas.width)) * (canvas.width / canvas.height) + (canvas.width / canvas.height)); // simpler keep correct aspect in shader
+    // set a more sane aspect value
+    gl.uniform1f(u_aspect, canvas.width / canvas.height);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(render);
+  }
+
+  requestAnimationFrame(render);
+
+  // hide hint after a second
+  setTimeout(()=>{ hint.style.display='none'; }, 1200);
+
+  // optional: allow tapping to toggle pause
+  let paused = false;
+  frame.addEventListener('click', ()=> {
+    if(!paused) { cancelAnimationFrame(render); paused = true; hint.innerText = "paused — tap again to resume"; hint.style.display='block'; }
+    else { paused = false; start = performance.now() - (performance.now() - start); requestAnimationFrame(render); hint.style.display='none'; }
+  });
+})();
+</script>
+</body>
+</html>
